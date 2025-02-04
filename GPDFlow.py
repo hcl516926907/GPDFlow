@@ -12,13 +12,16 @@ class DataTransform(nn.Module):
         inverse_transform(x_j): y_j = (1 / gamma_j)* log(1 + gamma_j * x_j / sigma_j)
     """
 
-    def __init__(self, dim, device):
+    def __init__(self, dim, device,fix_margin):
         super().__init__()
         self.dim = dim
         # Store log_sigma so sigma = exp(log_sigma) > 0
-        self.log_sigma = nn.Parameter(torch.zeros(dim, device=device))
-        
-        self.theta = nn.Parameter(torch.zeros(dim, device=device))
+        if fix_margin:
+            self.log_sigma = torch.zeros(dim, device=device)
+            self.theta = torch.zeros(dim, device=device)
+        else:
+            self.log_sigma = nn.Parameter(torch.zeros(dim, device=device))
+            self.theta = nn.Parameter(torch.zeros(dim, device=device))
         
     def get_sigma(self):
         sigma = torch.exp(self.log_sigma)
@@ -116,11 +119,11 @@ class T_mGPD_NF(nn.Module):
        3) The log-det Jacobian of x->y is the sum of log(d y_i / d x_i).
           We'll compute that from the known formula for inverse_transform.
     """
-    def __init__(self, dim, flow, device, s_min , s_max, num_integration_points, penalty_lambda):
+    def __init__(self, dim, flow, device, s_min , s_max, num_integration_points, penalty_lambda, fix_margin):
         super().__init__()
         self.dim = dim
         # Learnable data transformation
-        self.data_transform = DataTransform(dim, device)
+        self.data_transform = DataTransform(dim, device, fix_margin)
         # RealNVP flow model
         self.flow_model = flow
         self.device = device

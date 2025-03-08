@@ -170,7 +170,28 @@ class T_mGPD_NF(nn.Module):
         log_prob = log_integral - max_T
         return log_prob
     
-    
+    def log_prob(self, x_data):
+        y = self.data_transform.inverse_transform(x_data)
+
+        # 2) log prob under flow
+        log_prob_y = self.log_prob_T_mGPD_std(y)
+
+        # 3) log | det dy/dx
+        sigma = self.data_transform.get_sigma()
+        gamma = self.data_transform.get_gamma()
+
+        sigma = sigma.unsqueeze(0)  # (1, dim)
+        gamma = gamma.unsqueeze(0)  # (1, dim)
+
+        # Build inside = sigma + gamma*x
+        inside = sigma + gamma * x_data
+
+        # log_abs_detJ per sample = - sum_j log(inside_j)
+        log_abs_detJ = -torch.sum(torch.log(inside.abs() + 1e-12), dim=1)
+        
+        # => log p(x_data) = log p(y) + log|det dy/dx|
+        log_prob_x = log_prob_y + log_abs_detJ
+        return log_prob_x
         
 
     def forward(self, x_data):

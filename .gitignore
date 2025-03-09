@@ -3,3 +3,4 @@
 *-checkpoint.ipynb
 lightning_logs/
 .ipynb_checkpoints/
+.gitignore

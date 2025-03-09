@@ -1,5 +1,10 @@
 import numpy as np
 import torch
+import normflows as nf
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from GPDFlow import T_mGPD_NF
+
+dir_out = "/home/pgrad2/2448355h/My_PhD_Project/01_Output/GPDFlow/"
 
 def sim_revexp_T_mgpd(n, d, a, beta, sig, gamma, MGPD=True, std=False):
     """
@@ -130,37 +135,6 @@ def empirical_upper_tail_dependence(X, p):
     return chi_u
 
 
-def pairwise_chi_empirical(dim, model, n_monte_carlo, n_experiments):
-    """
-    Load the esimated Calculate the all empirical pairwise chi(p) of the data simulated by GPDFlow
-
-    Args: 
-        dim (integer): dimension of the model
-        model (NN.module): GPDFlow with initialization
-        n_monte_carlo: number of samples from the model for monte carlo estimations
-        n_experiments: number of repeat of the simulation scenario  
-    
-    Returns:
-        sample_chi (dict): dictionary with the name of dimension pairs as the key and a list of
-        empirical chi in all experiments as the value
-    """
-
-    probs = np.linspace(0.80, 0.99, 100)
-    # Compute lambda_u for each quantile
-    sample_chi = {}
-    for i in range(dim-1):
-        for j in range(i+1,dim):
-            chi_values = []
-            for _ in range(n_experiments):  # Step 3: Repeat 200 times
-                # load the estimated weight
-                model.load_state_dict(torch.load(dir_out + f'model_{dim}D_100_{_}.pt', weights_only=True))
-                model.eval()
-                samples_obs, samples_std, samples_T= model.sample(n_monte_carlo)
-                sampled_data = samples_obs.cpu().data.numpy()
-                chi_values.append(empirical_upper_tail_dependence(sampled_data[:,[i,j]], 0.99))
-            sample_chi[f"{i+1}-{j+1}"] =  chi_values
-    
-    return sample_chi
 
 
 def GPDFlow(dim):
@@ -205,13 +179,47 @@ def GPDFlow(dim):
     return model
 
 
-def marginal_parameter_monte_carlo(dim):
+def pairwise_chi_empirical(dim, n_monte_carlo, n_experiments=100):
+    """
+    Load the esimated Calculate the all empirical pairwise chi(p) of the data simulated by GPDFlow
+
+    Args: 
+        dim (integer): dimension of the model
+        model (NN.module): GPDFlow with initialization
+        n_monte_carlo: number of samples from the model for monte carlo estimations
+        n_experiments: number of repeat of the simulation scenario  
+    
+    Returns:
+        sample_chi (dict): dictionary with the name of dimension pairs as the key and a list of
+        empirical chi in all experiments as the value
+    """
+
+    # Compute lambda_u for each quantile
+    model = GPDFlow(dim)
+    sample_chi = {}
+    for i in range(dim-1):
+        for j in range(i+1,dim):
+            chi_values = []
+            for _ in range(n_experiments):  # Step 3: Repeat 200 times
+                # load the estimated weight
+                model.load_state_dict(torch.load(dir_out + f'model_{dim}D_100_{_}.pt', weights_only=True))
+                model.eval()
+                samples_obs, samples_std, samples_T= model.sample(n_monte_carlo)
+                sampled_data = samples_obs.cpu().data.numpy()
+                chi_values.append(empirical_upper_tail_dependence(sampled_data[:,[i,j]], 0.99))
+            sample_chi[f"{i+1}-{j+1}"] =  chi_values
+    
+    return sample_chi
+
+
+def marginal_parameter_monte_carlo(dim, n_experiments=100):
     """
     Load the estimated sigma and gamma of GPDFlow models in a simulation scenario, 
     and save them in two dictionaries.
     
     Args: 
         dim (integer): dimension of the model.
+        n_experiments (integer): Number of repeat of the simulation
     
     Returns:
         sigma_dict(dict)， gamma_dict(dict): two dictionaries contains the estimated sigma and gamma of 
@@ -220,7 +228,7 @@ def marginal_parameter_monte_carlo(dim):
     """
     sigma_dict = {f'{i+1}': [] for i in range(dim)}
     gamma_dict = {f'{i+1}': [] for i in range(dim)}
-
+    model = GPDFlow(dim)
     for _ in range(n_experiments):  # Step 3: Repeat 200 times
         model.load_state_dict(torch.load(dir_out + f'model_{dim}D_100_{_}.pt', weights_only=True))
         model.eval()
@@ -263,3 +271,33 @@ def empirical_tail_dependence_measure(X, p, cond = 'and'):
         return 0.0
     measure = joint_exceedance / exceedance_X1
     return measure
+
+
+def empirical_survival(X, u, sign):
+    """
+    Calculate the empirical threshold exceedance probability 
+
+    Args: 
+        X (array): n*d-dimensional data matrix
+        u (array): d-dimensional vector of the threshold  
+        sign (string): a d-length string combination of ">" and "<",  which tells the way of threshold exceedance. For example,
+        "><" means P(X_1 > u_1, X_2 < u_2)
+
+    Returns:
+        prob (float): empirical threshold exceedance probability
+    """
+
+    n_obs = X.shape[0]
+    n_dim = X.shape[1]
+    cond = np.array([True]*n_obs)
+    sign = list(sign)
+    for j in range(n_dim):
+        s = sign.pop(0)
+        if s == '>':
+            cond &= X[:,j] > u[j]
+        else:
+            cond &= X[:,j] < u[j]
+    # Count joint exceedances
+    joint_exceedance = np.sum(cond)
+
+    return joint_exceedance/n_obs

@@ -35,21 +35,20 @@ class DataTransform(nn.Module):
         
     def forward_transform(self, y):
         """
+        y: data on the standardized scale (sigma=1,gamma=0)
+        x: data on the observational scale 
         y -> x
         """
-#         y = torch.clamp(y, min= -1e6, max = 1e6)
         
         sigma = self.get_sigma()
         gamma = self.get_gamma()
         
-        # We'll do it elementwise, but in a vectorized way.
         # y and x are shape (batch_size, dim).
     
         x_out = torch.zeros_like(y)
 
         # For gamma_j = 0 => x_j = sigma_j * y_j
         # For gamma_j != 0 => x_j = sigma_j*(exp(gamma_j*y_j) - 1)/gamma_j
-        # We can use torch.where(...) to handle each dimension separately.
 
         # Expand so shapes match for broadcasting
         sigma = sigma.unsqueeze(0)  # (1, dim)
@@ -58,14 +57,15 @@ class DataTransform(nn.Module):
         # Exponential case: x_j = sigma_j*(exp(gamma_j*y_j) - 1)/gamma_j
         x_out = sigma * (torch.exp(torch.clamp(gamma * y, max=10)) - 1.0) / gamma
         
-#         x_out = torch.clamp(x_out, min= -1e10, max = 1e10)
         return x_out
 
     def inverse_transform(self, x):
         """
+        y: data on the standardized scale (sigma=1,gamma=0)
+        x: data on the observational scale 
+
         x -> y
         """
-#         x = torch.clamp(x, min= -1e10, max = 1e10)
         
         sigma = self.get_sigma()
         gamma = self.get_gamma()
@@ -135,7 +135,7 @@ class T_mGPD_NF(nn.Module):
         self.penalty_lambda = penalty_lambda
         
     def log_integral_f_T(self, data):
-            # Expand batch_x to match s_values
+        # Expand batch_x to match s_values
         batch_size = data.shape[0]
         dim = data.shape[1]
         

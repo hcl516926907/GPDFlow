@@ -1,6 +1,0 @@
-*.ipynb_checkpoints
-*.pyc
-*-checkpoint.ipynb
-lightning_logs/
-.ipynb_checkpoints/
-.gitignore

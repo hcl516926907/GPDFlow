@@ -1,10 +1,10 @@
-# GPDFlow: Generative Multivariate Threshold Exceedance Modeling via Normalizing Flow
+# GPDFlow: Generative Multivariate Threshold Exceedance Modeling via Normalizing Flows
 
 This repository contains the code and resources necessary to reproduce the results presented in the paper:
 
-**"GPDFlow: Generative Multivariate Threshold Exceedance Modeling via Normalizing Flow"**
+**"GPDFlow: Generative Multivariate Threshold Exceedance Modeling via Normalizing Flows"**
 
-GPDFlow is a generative modeling approach designed for threshold exceedance modeling by integrating the Multivariate Generalized Pareto Distribution (mGPD) with normalizing flows. It is coded in Python by Pytorch and normflows package.
+GPDFlow is a generative modeling approach designed for threshold exceedance modeling by integrating the Multivariate Generalized Pareto Distribution (mGPD) with normalizing flows. It is coded in Python by Pytorch and the normflows package.
 
 ## Repository Structure
 

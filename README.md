@@ -1,10 +1,10 @@
-# GPDFlow: Generative Multivariate Threshold Exceedance Modeling by Normalizing Flow
+# GPDFlow: Generative Multivariate Threshold Exceedance Modeling via Normalizing Flows
 
 This repository contains the code and resources necessary to reproduce the results presented in the paper:
 
-**"GPDFlow: Generative Multivariate Threshold Exceedance Modeling by Normalizing Flow"**
+**"GPDFlow: Generative Multivariate Threshold Exceedance Modeling via Normalizing Flows"**
 
-GPDFlow is a generative modeling approach designed for threshold exceedance modeling by integrating the Multivariate Generalized Pareto Distribution (mGPD) with normalizing flows. It is coded in Python by Pytorch and normflows package.
+GPDFlow is a generative modeling approach designed for threshold exceedance modeling by integrating the Multivariate Generalized Pareto Distribution (mGPD) with normalizing flows. It is coded in Python by Pytorch and the normflows package.
 
 ## Repository Structure
 
@@ -32,6 +32,9 @@ GPDFlow is a generative modeling approach designed for threshold exceedance mode
 - **`GPDFlow.py`**:
   - Python script providing the implementation and setup of the GPDFlow model.
 
+- **`Common_Functions.py`**:
+  - Python script providing various utilities (e.g., empirical chi plotting, T-mGPD sampling, theoretical tail dependence calculations) that are not part of the core GPDFlow implementation.
+
 - **`mGPD_Estimation.R`**:
   - R script containing the code to fit the classic Multivariate Generalized Pareto Distribution (mGPD).
 
@@ -39,6 +42,6 @@ GPDFlow is a generative modeling approach designed for threshold exceedance mode
 
 Clone the repository and navigate through the notebooks and scripts to replicate experiments, simulations, and applications as described in the paper.
 
-Please ensure you have Python, R, and required libraries installed to run the notebooks and scripts successfully.
+Please ensure you have Python, R, and the required libraries installed to run the notebooks and scripts successfully.
 
 

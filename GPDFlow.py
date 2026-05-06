@@ -1,5 +1,8 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 class DataTransform(nn.Module):
     """
@@ -12,7 +15,7 @@ class DataTransform(nn.Module):
         inverse_transform(x_j): y_j = (1 / gamma_j)* log(1 + gamma_j * x_j / sigma_j)
     """
 
-    def __init__(self, dim, device,fix_margin):
+    def __init__(self, dim, device, fix_margin):
         super().__init__()
         self.dim = dim
         # Store log_sigma so sigma = exp(log_sigma) > 0
@@ -22,73 +25,59 @@ class DataTransform(nn.Module):
         else:
             self.log_sigma = nn.Parameter(torch.zeros(dim, device=device))
             self.theta = nn.Parameter(torch.zeros(dim, device=device))
-        
+
     def get_sigma(self):
         sigma = torch.exp(self.log_sigma)
-        sigma = torch.clamp(sigma, min = 1e-6, max = 1e6)
+        sigma = torch.clamp(sigma, min=1e-6, max=1e6)
         return sigma
-    
+
     def get_gamma(self):
-        gamma = -0.5 + torch.sigmoid(self.theta)  + 1e-6 
-        gamma = gamma.sign() * torch.max(gamma.abs(), torch.tensor(1e-6, device=gamma.device))
+        gamma = 0.5 * torch.tanh(self.theta)
         return gamma
-        
+
     def forward_transform(self, y):
-        """
-        y: data on the standardized scale (sigma=1,gamma=0)
-        x: data on the observational scale 
-        y -> x
-        """
-        
-        sigma = self.get_sigma()
-        gamma = self.get_gamma()
-        
-        # y and x are shape (batch_size, dim).
-    
-        x_out = torch.zeros_like(y)
+        sigma = self.get_sigma().unsqueeze(0)
+        gamma = self.get_gamma().unsqueeze(0)
 
-        # For gamma_j = 0 => x_j = sigma_j * y_j
-        # For gamma_j != 0 => x_j = sigma_j*(exp(gamma_j*y_j) - 1)/gamma_j
+        sigma_b = sigma.expand_as(y)
+        gamma_b = gamma.expand_as(y)
 
-        # Expand so shapes match for broadcasting
-        sigma = sigma.unsqueeze(0)  # (1, dim)
-        gamma = gamma.unsqueeze(0)  # (1, dim)
-
-        # Exponential case: x_j = sigma_j*(exp(gamma_j*y_j) - 1)/gamma_j
-        x_out = sigma * (torch.exp(torch.clamp(gamma * y, max=10)) - 1.0) / gamma
-        
-        return x_out
+        # Reformulate sigma*expm1(gamma*y)/gamma as sigma*y*expm1(t)/t where t=gamma*y.
+        # This avoids dividing by gamma, whose 1/gamma^2 backward gradient caused NaN
+        # when |gamma| was near eps and quantile_lambda was large.
+        t = gamma_b * y
+        eps = 1e-3
+        is_small = t.abs() < eps
+        safe_t = torch.where(is_small, torch.ones_like(t), t)
+        expm1_over_t = torch.where(
+            is_small,
+            1.0 + t / 2.0 + (t ** 2) / 6.0 + (t ** 3) / 24.0,
+            torch.expm1(t) / safe_t,
+        )
+        return sigma_b * y * expm1_over_t
 
     def inverse_transform(self, x):
-        """
-        y: data on the standardized scale (sigma=1,gamma=0)
-        x: data on the observational scale 
+        sigma = self.get_sigma().unsqueeze(0)
+        gamma = self.get_gamma().unsqueeze(0)
 
-        x -> y
-        """
-        
-        sigma = self.get_sigma()
-        gamma = self.get_gamma()
+        sigma_b = sigma.expand_as(x)
+        gamma_b = gamma.expand_as(x)
 
-        y_out = torch.zeros_like(x)
-
-        # For gamma_j = 0 => y_j = x_j / sigma_j
-        # For gamma_j != 0 => y_j = (1/gamma_j)* log(1 + gamma_j*x_j / sigma_j)
-        sigma = sigma.unsqueeze(0)  # (1, dim)
-        gamma = gamma.unsqueeze(0)  # (1, dim)
-
-#         gamma_is_zero = (gamma.abs() < 1e-6)
-
-#         # Linear case: y_j = x_j / sigma_j
-#         y_linear = x / sigma
-
-        # Exponential (inverse) case: y_j = (1/gamma_j)* log(1 + gamma_j*x_j / sigma_j)
-        inside = 1.0 + (gamma * x) / sigma
-        inside = torch.clamp(inside, min=1e-12) 
-        y_out = (1.0 / gamma) * torch.log(inside)
-
-#         y_out = torch.clamp(y_out, min= -1e6, max = 1e6)
-        return y_out
+        # Reformulate log1p(gamma*x/sigma)/gamma as (x/sigma)*log1p(t)/t where t=gamma*x/sigma.
+        # This avoids dividing by gamma, whose 1/gamma^2 backward gradient caused NaN
+        # when |gamma| was near eps and quantile_lambda was large.
+        w = x / sigma_b
+        t = gamma_b * w
+        t = torch.clamp(t, min=-1.0 + 1e-7)
+        eps = 1e-3
+        is_small = t.abs() < eps
+        safe_t = torch.where(is_small, torch.ones_like(t), t)
+        log1p_over_t = torch.where(
+            is_small,
+            1.0 - t / 2.0 + (t ** 2) / 3.0 - (t ** 3) / 4.0,
+            torch.log1p(t) / safe_t,
+        )
+        return w * log1p_over_t
 
     def forward(self, z, reverse=False):
         """
@@ -96,11 +85,7 @@ class DataTransform(nn.Module):
           - If reverse=False: we do y->x
           - If reverse=True: we do x->y
         """
-        if not reverse:
-            return self.forward_transform(z)
-        else:
-            return self.inverse_transform(z)
-
+        return self.inverse_transform(z) if reverse else self.forward_transform(z)
 
 
 class T_mGPD_NF(nn.Module):
@@ -119,117 +104,177 @@ class T_mGPD_NF(nn.Module):
        3) The log-det Jacobian of x->y is the sum of log(d y_i / d x_i).
           We'll compute that from the known formula for inverse_transform.
     """
-    def __init__(self, dim, flow, device, s_min , s_max, num_integration_points, penalty_lambda, fix_margin):
+
+    def __init__(
+        self,
+        dim,
+        flow,
+        device,
+        s_min,
+        s_max,
+        num_integration_points,
+        penalty_lambda,
+        fix_margin,
+        mse_quantile_lambda=0.0,
+        quantile_min_exceedances=1,
+    ):
         super().__init__()
         self.dim = dim
-        # Learnable data transformation
-        self.data_transform = DataTransform(dim, device, fix_margin)
-        # RealNVP flow model
-        self.flow_model = flow
         self.device = device
-        self.s_values = torch.linspace(s_min, s_max, num_integration_points, device=device)
-        self.s_values = self.s_values.reshape(-1, 1, 1)
+        self.penalty_lambda = penalty_lambda
+        self.mse_quantile_lambda = mse_quantile_lambda
+        self.quantile_min_exceedances = quantile_min_exceedances
+
+        self.data_transform = DataTransform(dim, device, fix_margin)
+
+        self.flow_model = flow
+        self.s_values = torch.linspace(
+            s_min, s_max, num_integration_points, device=device
+        ).reshape(-1, 1, 1)
         self.s_min = s_min
         self.s_max = s_max
         self.num_integration_points = num_integration_points
-        self.penalty_lambda = penalty_lambda
-        
+
+    def get_sigma(self):
+        return self.data_transform.get_sigma()
+
+    def get_gamma(self):
+        return self.data_transform.get_gamma()
+
     def log_integral_f_T(self, data):
-        # Expand batch_x to match s_values
         batch_size = data.shape[0]
         dim = data.shape[1]
-        
-        x_expanded = data.unsqueeze(0)  # Shape (1, effective_batch_size, dim)
-        x_expanded = x_expanded.expand(self.num_integration_points, -1, -1)  # Shape (num_points, batch_size, dim)
 
-        # Expand s_values to match batch size and dimension
-        s_expanded = self.s_values.expand(-1, batch_size, 1)  # Shape (num_points, batch_size, 1)
+        x_expanded = data.unsqueeze(0).expand(self.num_integration_points, -1, -1)
+        s_expanded = self.s_values.expand(-1, batch_size, 1)
+        x_plus_s = (x_expanded + s_expanded).reshape(-1, dim)
 
-        # Compute x + s for all s_values
-        x_plus_s = x_expanded + s_expanded  # Broadcasting over the last dimension
-        x_plus_s = x_plus_s.reshape(-1, dim)  # Flatten to (num_points * batch_size, dim)
-
-        log_f_T = self.flow_model.log_prob(x_plus_s)  # Shape (num_points * batch_size,)
+        log_f_T = self.flow_model.log_prob(x_plus_s)
         log_integrand = log_f_T.reshape(self.num_integration_points, batch_size)
-        
-        # 1. log-sum-exp over 'num_points' dimension
-        max_vals, _ = torch.max(log_integrand, dim=0, keepdim=True)  # shape (1, batch_size)
-        stable_exp = torch.exp(log_integrand - max_vals)             # shape (num_points, batch_size)
-        
+
+        max_vals, _ = torch.max(log_integrand, dim=0, keepdim=True)
+        stable_exp = torch.exp(log_integrand - max_vals)
+
         delta_s = (self.s_max - self.s_min) / (self.num_integration_points - 1)
-        sum_exp = torch.trapz(stable_exp, dx=delta_s, dim=0)         # shape (batch_size,)
-        # 2. Now put the max_vals back in:
-        log_integral = max_vals.squeeze(0) + torch.log(sum_exp + 1e-40)  # shape (batch_size,)
-        
+        sum_exp = torch.trapz(stable_exp, dx=delta_s, dim=0)
+
+        log_integral = max_vals.squeeze(0) + torch.log(sum_exp + 1e-20)
         return log_integral
-    
+
     def log_prob_T_mGPD_std(self, data):
         log_integral = self.log_integral_f_T(data)
         max_T = torch.max(data, dim=1)[0]
-        
-        log_prob = log_integral - max_T
-        return log_prob
-    
-    def log_prob(self, x_data):
-        y = self.data_transform.inverse_transform(x_data)
+        return log_integral - max_T
 
-        # 2) log prob under flow
-        log_prob_y = self.log_prob_T_mGPD_std(y)
+    def log_prob(self, x_data, very_negative=-1e30):
+        sigma = self.get_sigma().unsqueeze(0)
+        gamma = self.get_gamma().unsqueeze(0)
+        inside_raw = sigma + gamma * x_data
+        valid = (inside_raw > 0).all(dim=1)
 
-        # 3) log | det dy/dx
-        sigma = self.data_transform.get_sigma()
-        gamma = self.data_transform.get_gamma()
+        log_prob_x = torch.full(
+            (x_data.size(0),),
+            float(very_negative),
+            device=x_data.device,
+            dtype=x_data.dtype,
+        )
 
-        sigma = sigma.unsqueeze(0)  # (1, dim)
-        gamma = gamma.unsqueeze(0)  # (1, dim)
+        if valid.any():
+            x_v = x_data[valid]
+            inside_v = inside_raw[valid]
+            y_v = self.data_transform.inverse_transform(x_v)
+            log_prob_y_v = self.log_prob_T_mGPD_std(y_v)
+            log_abs_detJ_v = -torch.sum(torch.log(inside_v), dim=1)
+            log_prob_x[valid] = log_prob_y_v + log_abs_detJ_v
 
-        # Build inside = sigma + gamma*x
-        inside = sigma + gamma * x_data
-
-        # log_abs_detJ per sample = - sum_j log(inside_j)
-        log_abs_detJ = -torch.sum(torch.log(inside.abs() + 1e-12), dim=1)
-        
-        # => log p(x_data) = log p(y) + log|det dy/dx|
-        log_prob_x = log_prob_y + log_abs_detJ
         return log_prob_x
-        
 
-    def forward(self, x_data):
-        """
-        Return minus log p_data(x_data).
-        We do:
-          y = T_inv(x_data)  [since T_inv is x->y]
-          log p_data(x_data) = log p_flow(y) + log|det(d y / d x)|
-        """
-        # 1) x->y
+    def _exceedance_mask(self, x_data, inside_raw):
+        mask = (x_data > 0 ) & (inside_raw > 0)
+        active = mask.sum(dim=0) >= self.quantile_min_exceedances
+        return mask, active
+
+    def mse_quantile_loss(self, x_data, inside_raw):
+        dtype = x_data.dtype
+        device = x_data.device
+        mask, active = self._exceedance_mask(x_data, inside_raw)
+
+        if not active.any():
+            return torch.tensor(0.0, device=device, dtype=dtype)
+
         y = self.data_transform.inverse_transform(x_data)
 
-        # 2) log prob under flow
-        log_prob_y = self.log_prob_T_mGPD_std(y)
+        loss_per_margin = torch.zeros(self.dim, device=device, dtype=dtype)
+        for j in range(self.dim):
+            if not active[j]:
+                continue
+            yj_sorted, _ = torch.sort(y[:, j][mask[:, j]])
+            n_j = yj_sorted.shape[0]
+            p = torch.arange(1, n_j + 1, device=device, dtype=dtype) / (n_j + 1)
+            t = -torch.log(1.0 - p)
+            loss_per_margin[j] = ((yj_sorted - t) ** 2).mean()
 
-        # 3) log | det dy/dx
-        sigma = self.data_transform.get_sigma()
-        gamma = self.data_transform.get_gamma()
+        return loss_per_margin[active].mean()
 
-        sigma = sigma.unsqueeze(0)  # (1, dim)
-        gamma = gamma.unsqueeze(0)  # (1, dim)
+    def loss_components(self, x_data, very_negative=-1e30, x_data_quantile=None):
+        sigma = self.get_sigma().unsqueeze(0)
+        gamma = self.get_gamma().unsqueeze(0)
 
-        # Build inside = sigma + gamma*x
-        inside = sigma + gamma * x_data
+        inside_raw = sigma + gamma * x_data
+        valid = (inside_raw > 0).all(dim=1)
 
-        # log_abs_detJ per sample = - sum_j log(inside_j)
-        log_abs_detJ = -torch.sum(torch.log(inside.abs() + 1e-12), dim=1)
-        
-        # => log p(x_data) = log p(y) + log|det dy/dx|
-        log_prob_x = log_prob_y + log_abs_detJ
-        
-        ######## Soft penalty: penalize negative (sigma_j + gamma_j*x_j)
-        negative_part = torch.relu(-inside)  # = max(0, -(inside)) => positive if inside<0
-        # penalty = sum_j [ negative_part^2 ] over j, average over batch
-        penalty_per_sample = (negative_part ** 2).sum(dim=1)
-        penalty = self.penalty_lambda * penalty_per_sample.mean()
-        
-        return -log_prob_x.mean() +  penalty 
+        log_prob_x = torch.full(
+            (x_data.size(0),),
+            float(very_negative),
+            device=x_data.device,
+            dtype=x_data.dtype,
+        )
+
+        if valid.any():
+            x_v = x_data[valid]
+            inside_v = inside_raw[valid]
+            y_v = self.data_transform.inverse_transform(x_v)
+            log_prob_y_v = self.log_prob_T_mGPD_std(y_v)
+            log_abs_detJ_v = -torch.sum(torch.log(inside_v), dim=1)
+            log_prob_x[valid] = log_prob_y_v + log_abs_detJ_v
+            nll = -log_prob_x[valid].mean()
+        else:
+            nll = torch.tensor(0.0, device=x_data.device, dtype=x_data.dtype)
+
+        negative_part = torch.relu(-inside_raw)
+        support_loss = (negative_part ** 2).sum(dim=1).mean()
+
+        if x_data_quantile is not None:
+            x_q = x_data_quantile
+            inside_raw_q = self.get_sigma().unsqueeze(0) + self.get_gamma().unsqueeze(0) * x_q
+        else:
+            x_q = x_data
+            inside_raw_q = inside_raw
+
+        mse_q_loss = self.mse_quantile_loss(x_q, inside_raw_q)
+
+        support_loss_weighted = self.penalty_lambda      * support_loss
+        mse_q_loss_weighted   = self.mse_quantile_lambda * mse_q_loss
+
+        total_loss = nll + support_loss_weighted + mse_q_loss_weighted
+
+        return {
+            "nll": nll,
+            "support_loss": support_loss,
+            "support_loss_weighted": support_loss_weighted,
+            "mse_quantile_loss": mse_q_loss,
+            "mse_quantile_loss_weighted": mse_q_loss_weighted,
+            "total_loss": total_loss,
+            "num_valid_rows": valid.sum(),
+        }
+
+    def forward(self, x_data, very_negative=-1e30, return_components=False, x_data_quantile=None):
+        comps = self.loss_components(x_data, very_negative=very_negative, x_data_quantile=x_data_quantile)
+
+        if return_components:
+            return comps
+
+        return comps["total_loss"]
 
     def sample(self, n_samples=1):
         """
@@ -238,16 +283,14 @@ class T_mGPD_NF(nn.Module):
           2) Convert y->x using forward_transform
         """
         self.flow_model.eval()
-        samples_T,_ = self.flow_model.sample(n_samples)
+        samples_T, _ = self.flow_model.sample(n_samples)
         self.flow_model.train()
-        
-        samples_T_max = torch.max(samples_T,axis=1,keepdim=True)[0]
+
+        samples_T_max = torch.max(samples_T, axis=1, keepdim=True)[0]
         samples_T_1 = samples_T - samples_T_max
-        
-        samples_E  = torch.empty(n_samples, device=self.device)
-        samples_E = samples_E.exponential_(1.0).unsqueeze(1)
-        
+
+        samples_E = torch.empty(n_samples, device=self.device).exponential_(1.0).unsqueeze(1)
         samples_y = samples_E + samples_T_1
 
-        samples_x = self.data_transform.forward_transform(samples_y)  # y->x
+        samples_x = self.data_transform.forward_transform(samples_y)
         return samples_x, samples_y, samples_T

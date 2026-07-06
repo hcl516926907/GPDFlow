@@ -109,6 +109,67 @@ def pairwise_chi_theorical(alpha_vector):
 
 
 
+def pairwise_chi_from_data(X, p=0.95):
+    """
+    Compute the d×d matrix of pairwise empirical upper tail-dependence coefficients
+    from an n×d data matrix.
+
+    Uses the standard extreme-value estimator
+
+        chi_hat_{ij}(p) = P_hat(U_i > p, U_j > p) / (1 - p)
+
+    where U_{t,i} = rank(X_{t,i}) / n are the probability-integral-transformed
+    (pseudo-uniform) observations.  The estimator is symmetric in i and j.
+
+    Args:
+        X (ndarray): n × d data matrix (raw or standardised scale)
+        p (float):   quantile level in (0, 1), e.g. 0.95 or 0.99
+
+    Returns:
+        chi_matrix (ndarray): d × d symmetric matrix; diagonal entries = 1.0
+    """
+    X = np.asarray(X, dtype=float)
+    n, d = X.shape
+
+    # Rank-based probability-integral transform → U in (0, 1)
+    from scipy.stats import rankdata
+    U = np.column_stack([rankdata(X[:, j]) / n for j in range(d)])  # (n, d)
+
+    exceed = U > p          # (n, d) bool
+    n_marg = exceed.sum(0)  # (d,): marginal exceedance counts
+
+    # n_joint[i, j] = #{t : U_{t,i} > p AND U_{t,j} > p}  (symmetric)
+    n_joint = exceed.T.astype(float) @ exceed.astype(float)  # (d, d)
+
+    # Denominator: expected count under independence = n * (1-p)
+    denom = n * (1.0 - p)
+
+    chi_matrix = n_joint / denom
+    np.fill_diagonal(chi_matrix, 1.0)
+    return chi_matrix
+
+
+def pairwise_chi_from_data_dict(X, p=0.95):
+    """
+    Same as pairwise_chi_from_data but returns a dict keyed by "i-j" (1-indexed),
+    matching the format used by pairwise_chi_theorical.
+
+    Args:
+        X (ndarray): n × d data matrix
+        p (float):   quantile level
+
+    Returns:
+        chi_dict (dict): keys "i-j" for i < j, values chi_hat_{ij}(p)
+    """
+    chi_matrix = pairwise_chi_from_data(X, p)
+    d = chi_matrix.shape[0]
+    chi_dict = {}
+    for i in range(d - 1):
+        for j in range(i + 1, d):
+            chi_dict[f"{i+1}-{j+1}"] = float(chi_matrix[i, j])
+    return chi_dict
+
+
 def empirical_upper_tail_dependence(X, p):
     """
     Calculate the empirical pairwise chi(p) of the data
@@ -271,6 +332,117 @@ def empirical_tail_dependence_measure(X, p, cond = 'and'):
         return 0.0
     measure = joint_exceedance / exceedance_X1
     return measure
+
+
+def rmse_gamma(gamma_hat, gamma_true):
+    """
+    Compute RMSE for the shape parameter gamma across d margins.
+
+    Args:
+        gamma_hat  (array): estimated shape parameters, length d
+        gamma_true (array): true shape parameters, length d
+
+    Returns:
+        rmse (float)
+    """
+    gamma_hat = np.asarray(gamma_hat)
+    gamma_true = np.asarray(gamma_true)
+    return np.sqrt(np.mean((gamma_hat - gamma_true) ** 2))
+
+
+def rmse_log_sigma(sigma_hat, sigma_true):
+    """
+    Compute RMSE for the scale parameter sigma on the log scale across d margins.
+
+    Args:
+        sigma_hat  (array): estimated scale parameters, length d
+        sigma_true (array): true scale parameters, length d
+
+    Returns:
+        rmse (float)
+    """
+    sigma_hat = np.asarray(sigma_hat, dtype=float)
+    sigma_true = np.asarray(sigma_true, dtype=float)
+    return np.sqrt(np.mean((np.log(sigma_hat) - np.log(sigma_true)) ** 2))
+
+
+def tde_chi(chi_hat, chi_true):
+    """
+    Average pairwise absolute error for the upper tail-dependence coefficient chi.
+
+    TDE = (2 / (d*(d-1))) * sum_{j<k} |chi_hat_jk - chi_true_jk|
+
+    Args:
+        chi_hat  (ndarray): d × d symmetric matrix of estimated chi values
+                            (as returned by pairwise_chi_from_data)
+        chi_true (ndarray): d × d symmetric matrix of true chi values
+
+    Returns:
+        tde (float)
+    """
+    chi_hat = np.asarray(chi_hat, dtype=float)
+    chi_true = np.asarray(chi_true, dtype=float)
+    d = chi_hat.shape[0]
+    idx = np.triu_indices(d, k=1)
+    return np.mean(np.abs(chi_hat[idx] - chi_true[idx]))
+
+
+def rmse_chi(chi_hat, chi_true):
+    """
+    RMSE for the upper tail-dependence coefficient chi over all pairs.
+
+    RMSE_chi = sqrt((2 / (d*(d-1))) * sum_{j<k} (chi_hat_jk - chi_true_jk)^2)
+             = sqrt(mean((chi_hat - chi_true)^2))  over all pairs
+
+    Args:
+        chi_hat  (array): estimated pairwise chi values, length d*(d-1)/2
+        chi_true (array): true pairwise chi values, same length
+
+    Returns:
+        rmse (float)
+    """
+    chi_hat = np.asarray(chi_hat)
+    chi_true = np.asarray(chi_true)
+    return np.sqrt(np.mean((chi_hat - chi_true) ** 2))
+
+
+def ljpe(p_hat, p_true, eps=1e-12):
+    """
+    Log joint probability error: average absolute log-ratio of estimated
+    to true exceedance probabilities.
+
+    LJPE = (1/L) * sum_l |log(max(p_hat_l, eps)) - log(p_true_l)|
+
+    Args:
+        p_hat  (array): estimated exceedance probabilities, length L
+        p_true (array): true exceedance probabilities, length L
+        eps    (float): numerical floor applied to p_hat before log (default 1e-12)
+
+    Returns:
+        ljpe_val (float)
+    """
+    p_hat = np.asarray(p_hat, dtype=float)
+    p_true = np.asarray(p_true, dtype=float)
+    return np.mean(np.abs(np.log(np.maximum(p_hat, eps)) - np.log(p_true)))
+
+
+def rmsle_p(p_hat, p_true, eps=1e-12):
+    """
+    Root mean squared log error for exceedance probabilities.
+
+    RMSLE_p = sqrt((1/L) * sum_l (log(max(p_hat_l, eps)) - log(p_true_l))^2)
+
+    Args:
+        p_hat  (array): estimated exceedance probabilities, length L
+        p_true (array): true exceedance probabilities, length L
+        eps    (float): numerical floor applied to p_hat before log (default 1e-12)
+
+    Returns:
+        rmsle (float)
+    """
+    p_hat = np.asarray(p_hat, dtype=float)
+    p_true = np.asarray(p_true, dtype=float)
+    return np.sqrt(np.mean((np.log(np.maximum(p_hat, eps)) - np.log(p_true)) ** 2))
 
 
 def empirical_survival(X, u, sign):

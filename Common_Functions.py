@@ -107,6 +107,43 @@ def pairwise_chi_theorical(alpha_vector):
     return chi_dict
 
 
+def ar1_correlation(d, rho):
+    """
+    AR(1) correlation matrix R[i, j] = rho ** |i - j|  (d × d, unit diagonal).
+
+    Args:
+        d (integer): dimension
+        rho (float): base correlation in (-1, 1)
+
+    Returns:
+        R (ndarray): d × d correlation matrix
+    """
+    idx = np.arange(d)
+    return rho ** np.abs(idx[:, None] - idx[None, :])
+
+
+def t_copula_pairwise_chi(rho, nu):
+    """
+    Closed-form upper-tail dependence coefficient chi for a Student-t copula:
+
+        chi = 2 * T_{nu+1}( -sqrt( (nu + 1) (1 - rho) / (1 + rho) ) )
+
+    Args:
+        rho (float or ndarray): scalar correlation, or a d × d correlation matrix
+                                (e.g. from ar1_correlation)
+        nu (float): degrees of freedom of the t-copula
+
+    Returns:
+        chi (float or ndarray): same shape as rho; if rho is a d × d matrix the
+                                diagonal is set to 1.0
+    """
+    from scipy.stats import t as _t
+    rho = np.asarray(rho, dtype=float)
+    arg = -np.sqrt(np.clip((nu + 1.0) * (1.0 - rho) / (1.0 + rho), 0.0, None))
+    chi = 2.0 * _t.cdf(arg, df=nu + 1.0)
+    if chi.ndim == 2 and chi.shape[0] == chi.shape[1]:
+        np.fill_diagonal(chi, 1.0)
+    return chi
 
 
 def pairwise_chi_from_data(X, p=0.95):
@@ -147,6 +184,49 @@ def pairwise_chi_from_data(X, p=0.95):
     chi_matrix = n_joint / denom
     np.fill_diagonal(chi_matrix, 1.0)
     return chi_matrix
+
+
+def pairwise_omega_from_data(X, p=0.95):
+    """
+    Compute the d×d matrix of pairwise empirical coefficients of tail correlation
+    from an n×d data matrix.
+
+    Uses the estimator
+
+        omega_hat_{ij}(p) = P_hat(U_i > p or U_j > p) / (1 - p)
+
+    where U_{t,i} = rank(X_{t,i}) / n are the probability-integral-transformed
+    (pseudo-uniform) observations.  The estimator is symmetric in i and j.
+
+    Args:
+        X (ndarray): n × d data matrix (raw or standardised scale)
+        p (float):   quantile level in (0, 1), e.g. 0.95 or 0.99
+
+    Returns:
+        omega_matrix (ndarray): d × d symmetric matrix; diagonal entries = 1.0
+    """
+    X = np.asarray(X, dtype=float)
+    n, d = X.shape
+
+    # Rank-based probability-integral transform → U in (0, 1)
+    from scipy.stats import rankdata
+    U = np.column_stack([rankdata(X[:, j]) / n for j in range(d)])  # (n, d)
+
+    exceed = U > p          # (n, d) bool
+    n_marg = exceed.sum(0)  # (d,): marginal exceedance counts
+
+    # n_and[i, j] = #{t : U_{t,i} > p AND U_{t,j} > p}  (symmetric)
+    n_and = exceed.T.astype(float) @ exceed.astype(float)  # (d, d)
+
+    # Inclusion-exclusion: #{t : U_{t,i} > p OR U_{t,j} > p}
+    n_or = n_marg[:, None] + n_marg[None, :] - n_and
+
+    # Denominator: expected count under independence = n * (1-p)
+    denom = n * (1.0 - p)
+
+    omega_matrix = n_or / denom
+    np.fill_diagonal(omega_matrix, 1.0)
+    return omega_matrix
 
 
 def pairwise_chi_from_data_dict(X, p=0.95):
@@ -332,6 +412,46 @@ def empirical_tail_dependence_measure(X, p, cond = 'and'):
         return 0.0
     measure = joint_exceedance / exceedance_X1
     return measure
+
+
+def simultaneous_exceedance_probability(X, u, m):
+    """
+    Empirical probability that more than m out of d margins simultaneously
+    exceed a common absolute threshold u: P(sum_j 1{X_j > u} > m).
+
+    Args:
+        X (array): n x d data matrix whose rows are checked against u.
+        u (float or array): absolute threshold applied directly to the columns
+        of X. A scalar is compared against every margin; an array of length d
+        gives a per-margin threshold. No quantile transform is applied, so X
+        and u must be on the same scale (pass simulated samples rescaled back
+        to the raw data scale).
+        m (int): exceedance-count threshold.
+
+    Returns:
+        prob (float): empirical P(sum_j 1{X_j > u} > m).
+    """
+    X = np.asarray(X, dtype=float)
+    n, d = X.shape
+    u = np.broadcast_to(np.asarray(u, dtype=float), (d,))
+    exceed_count = np.sum(X > u, axis=1)
+    return np.mean(exceed_count > m)
+
+
+def common_threshold_grid(X_ref, n=100, q_lo=0.97, q_hi=0.995):
+    """
+    Grid of common absolute thresholds over the range where a single threshold
+    lies between every margin's q_lo and q_hi empirical quantile:
+        lo = max_j quantile(X_ref[:, j], q_lo)
+        hi = min_j quantile(X_ref[:, j], q_hi)
+    Returns np.linspace(lo, hi, n). Raises if lo >= hi.
+    """
+    X_ref = np.asarray(X_ref, dtype=float)
+    lo = np.quantile(X_ref, q_lo, axis=0).max()
+    hi = np.quantile(X_ref, q_hi, axis=0).min()
+    if not lo < hi:
+        raise ValueError(f"empty threshold grid: lo={lo:.4g} >= hi={hi:.4g}")
+    return np.linspace(lo, hi, n)
 
 
 def rmse_gamma(gamma_hat, gamma_true):

@@ -369,6 +369,11 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
             ``T_max`` -- is left unchanged).  Used for the final full-data refit
             at the median of the per-fold CV early-stop epochs.
 
+    ``val_arr=None`` switches validation off: no early stopping / checkpoint
+    selection, training runs to ``stop_at_epoch`` (or ``epochs``) and the
+    final weights are kept; ``best_val`` is then ``nan`` and
+    ``hist['best_epoch']`` is the last completed epoch.
+
     Returns:
         (model, best_val, hist): the fitted ParametricMGPD (loaded with the
         best-validation-NLL state), that best validation NLL, and a history dict
@@ -398,7 +403,9 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
                 torch.atanh(torch.tensor(init_gamma, dtype=torch.float32, device=device)))
 
     train_data = torch.tensor(np.asarray(train_arr), dtype=torch.float32, device=device)
-    val_data = torch.tensor(np.asarray(val_arr), dtype=torch.float32, device=device)
+    no_val = val_arr is None
+    if not no_val:
+        val_data = torch.tensor(np.asarray(val_arr), dtype=torch.float32, device=device)
     loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=False)
 
     gen_groups = [{'params': [p], 'lr': 5e-3 if 'offdiag' in n else 1e-2}
@@ -425,6 +432,22 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
             optimizer.step()
             last = float(loss.detach())
         scheduler.step()
+
+        if no_val:
+            hist['train_batch'].append(last)
+            if bad >= patience:          # non-finite train loss
+                if verbose:
+                    print(f'  [{generator:10s}] ep {epoch:3d}  non-finite train loss -- stopping.')
+                break
+            best_epoch = epoch + 1
+            if verbose and (epoch % 50 == 0 or epoch == epochs - 1):
+                print(f'  [{generator:10s}] ep {epoch:3d}  batch loss {last:10.3f}')
+            if stop_at_epoch is not None and (epoch + 1) >= stop_at_epoch:
+                if verbose:
+                    print(f'  [{generator:10s}] stopping at fixed epoch {epoch + 1} '
+                          f'(stop_at_epoch).')
+                break
+            continue
 
         model.eval()
         with torch.no_grad():
@@ -461,7 +484,7 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
         model.load_state_dict(best_state)
     model.eval()
     hist['best_epoch'] = best_epoch
-    return model, best_val, hist
+    return model, (float('nan') if no_val else best_val), hist
 
 
 # ---------------------------------------------------------------------------

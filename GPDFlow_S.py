@@ -164,6 +164,44 @@ class ConditionalMaskedAffineFlow(nn.Module):
         return x_out, log_det
 
 
+class ConditionalSplineCoupling(nn.Module):
+    """
+    Rational-quadratic spline coupling layer (Neural Spline Flow, Durkan et al.
+    2019) conditioned on a face-index embedding.
+
+    Thin adapter around nf.flows.CoupledRationalQuadraticSpline exposing the
+    same (z, cond) API as ConditionalMaskedAffineFlow; cond is passed to the
+    spline-parameter ResidualNet as its context. The spline acts on
+    [-tail_bound, tail_bound] and is the identity outside (linear tails).
+    """
+
+    def __init__(self, latent_size, embed_dim, num_hidden, num_blocks=2,
+                 num_bins=8, tail_bound=5.0, reverse_mask=False):
+        super().__init__()
+        # With a single latent feature the non-reversed alternating mask has
+        # no transform features; the reversed one transforms it, conditioned
+        # on cond only.
+        if latent_size == 1:
+            reverse_mask = True
+        self.layer = nf.flows.CoupledRationalQuadraticSpline(
+            num_input_channels=latent_size,
+            num_blocks=num_blocks,
+            num_hidden_channels=num_hidden,
+            num_context_channels=embed_dim,
+            num_bins=num_bins,
+            tail_bound=tail_bound,
+            reverse_mask=reverse_mask,
+        )
+
+    def forward(self, z, cond):
+        """Generative direction (base → data). Returns (z_out, log_det)."""
+        return self.layer.forward(z, context=cond)
+
+    def inverse(self, x, cond):
+        """Normalizing direction (data → base). Returns (x_out, log_det)."""
+        return self.layer.inverse(x, context=cond)
+
+
 class ActNormConditional(nn.Module):
     """
     ActNorm wrapper that accepts (z, cond) to match the conditional flow API.
@@ -195,7 +233,8 @@ class ConditionalNormalizingFlow(nn.Module):
         Args:
             d:         original data dimension; face indices range over 0..d-1
             embed_dim: embedding dimension for the face index
-            flows:     list of ConditionalMaskedAffineFlow / ActNormConditional
+            flows:     list of ConditionalMaskedAffineFlow or
+                       ConditionalSplineCoupling, and ActNormConditional
             base:      DiagGaussian(d-1) base distribution
         """
         super().__init__()
@@ -225,6 +264,28 @@ class ConditionalNormalizingFlow(nn.Module):
             z, ld = flow.inverse(z, cond)
             log_det_acc = log_det_acc + ld
         return self.base.log_prob(z) + log_det_acc
+
+    @torch.no_grad()
+    def tail_coverage(self, x, k):
+        """
+        Fraction of inputs inside [-tail_bound, tail_bound] at each
+        ConditionalSplineCoupling, walking the normalizing (data → base)
+        direction as log_prob does. Outside that interval a spline is the
+        identity, so low coverage means the splines are mostly unused.
+
+        Returns:
+            list of floats, one per spline layer (data side first); empty for
+            a RealNVP flow.
+        """
+        cond = self.embedding(k)
+        z = x
+        coverage = []
+        for flow in reversed(self.flows):
+            if isinstance(flow, ConditionalSplineCoupling):
+                b = flow.layer.prqct.tail_bound
+                coverage.append(((z >= -b) & (z <= b)).float().mean().item())
+            z, _ = flow.inverse(z, cond)
+        return coverage
 
     def sample(self, n, k):
         """
@@ -361,6 +422,22 @@ class S_mGPD_NF(nn.Module):
         Returns:
             (batch,) log densities
         """
+        e, k, s_neg_k, r = self._face_coords(y)
+
+        # Log |Jac of h^{-1}|: d/dv[log(-v)] = 1/v → log|1/v| = -log(-v)
+        log_jac = -torch.log(-s_neg_k).sum(dim=1)              # (batch,)
+
+        log_pi = torch.log_softmax(self.log_pi_raw, dim=0)     # (d,) numerically stable
+        log_p_r = self.flow_model.log_prob(r, k)               # (batch,)
+
+        return log_pi[k] + log_p_r + log_jac - e
+
+    def _face_coords(self, y):
+        """
+        Split standardized observations y into (e, k, s_{-k}, r) with
+        e = max(y), k = argmax(y), s_{-k} = y_{-k} - e (all < 0) and
+        r = log(-s_{-k}), the flow's input.
+        """
         batch, d = y.shape
         e, k = y.max(dim=1)                                    # (batch,) each
 
@@ -374,14 +451,20 @@ class S_mGPD_NF(nn.Module):
 
         # Inverse of h(r) = -exp(r):  r = log(-v)
         r = torch.log(-s_neg_k)                                # (batch, d-1)
+        return e, k, s_neg_k, r
 
-        # Log |Jac of h^{-1}|: d/dv[log(-v)] = 1/v → log|1/v| = -log(-v)
-        log_jac = -torch.log(-s_neg_k).sum(dim=1)              # (batch,)
-
-        log_pi = torch.log_softmax(self.log_pi_raw, dim=0)     # (d,) numerically stable
-        log_p_r = self.flow_model.log_prob(r, k)               # (batch,)
-
-        return log_pi[k] + log_p_r + log_jac - e
+    @torch.no_grad()
+    def spline_tail_coverage(self, x_data):
+        """
+        Per-spline-layer fraction of the data's flow inputs that fall inside
+        the spline interval (see ConditionalNormalizingFlow.tail_coverage).
+        Rows outside the GPD support are skipped.
+        """
+        inside = self.get_sigma().unsqueeze(0) + self.get_gamma().unsqueeze(0) * x_data
+        x_v = x_data[(inside > 0).all(dim=1)]
+        y = self.data_transform.inverse_transform(x_v)
+        _, k, _, r = self._face_coords(y)
+        return self.flow_model.tail_coverage(r, k)
 
     def log_prob(self, x_data, very_negative=-1e30):
         sigma = self.get_sigma().unsqueeze(0)

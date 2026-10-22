@@ -1,5 +1,12 @@
 """Per-threshold hyperparameter tuning for Exchange_rate_threshold_sensitivity.ipynb.
 
+All three flow models use NSF (rational-quadratic spline) coupling layers
+(FLOW_TYPE = 'nsf').  The search spaces are anchored at the likelihood GPDFlow
+config LIK_CFG of Exchange_rate_application.ipynb (L4, lsf2, 3 bins, 1 block);
+the spline knobs (num_bins, num_blocks) are swept first, then depth / width,
+then the model-specific loss knobs.  tail_bound is fixed (5 for the GPDFlows,
+4 for the probit-scale baseline), not swept.
+
 For every threshold level q and model (likelihood GPDFlow, two-stage MMD GPDFlow,
 probit-copula RealNVP, parametric mGPD) a small coordinate-wise grid search over
 the Table 2 search spaces is run with 5-fold CV.  A config is scored by
@@ -44,40 +51,57 @@ from cv_utils import (
 Q_EVAL = 0.98
 SIM_MULT = 200
 DIR_OUT = "/home/pgrad2/2448355h/My_PhD_Project/GPDFlow/Data_and_Model/"
+RES_NAME = "threshold_sensitivity_nsf"           # RealNVP results stay in threshold_sensitivity/
+FLOW_TYPE = 'nsf'
+NSF_KEYS = ('num_bins', 'num_blocks', 'tail_bound')   # flat in the sweep, nested as flow_kw
 ORIGIN_CACHE = DIR_OUT + "threshold_sensitivity/samples_origin.npy"
 
 # --- Non-tuned settings: as in Exchange_rate_threshold_sensitivity.ipynb ------
 BASE = {
     'lik': dict(penalty_lambda=1e4, seed=1234),
-    'mmd': dict(penalty_lambda=1e4, mmd_samples_per_face=128,
+    'mmd': dict(warmup_epochs=50, min_delta=1e-3,
+                penalty_lambda=1e4, mmd_lambda=1, mmd_samples_per_face=128,
                 mmd_censor_c=0, mmd_censor_tau=0.2, seed=1234),
     'bl': dict(warmup=20, seed=0),
     'par': dict(seed=1234),
 }
 PATIENCE = dict(lik=100, mmd=100, bl=40)       # par: driver default (40)
 
-# --- Search spaces (Table 2; widths as factors) -------------------------------
+# --- Search spaces (NSF; widths as factors) ----------------------------------
 # Coordinate-wise sweep: start at START, sweep each key of SWEEP in order,
-# keep the best value before moving on.
+# keep the best value before moving on.  START['lik'] = LIK_CFG.
 START = {
-    'lik': dict(num_layers=3, latent_size_factor=3, marg_lambda=30),
-    'mmd': dict(num_layers=3, latent_size_factor=2,
-                mmd_indicator_alpha=5, mmd_indicator_rho=3),
-    'bl': dict(num_layers=6, hidden_mult=4),
+    'lik': dict(num_layers=4, latent_size_factor=2, marg_lambda=300,
+                num_bins=3, num_blocks=1, tail_bound=5.0),
+    'mmd': dict(num_layers=4, latent_size_factor=2,
+                num_bins=3, num_blocks=1, tail_bound=5.0,
+                mmd_indicator_alpha=10, mmd_indicator_rho=5),
+    'bl': dict(num_layers=4, hidden_mult=2,
+               num_bins=3, num_blocks=1, tail_bound=4.0),
     'par': dict(generator='gaussian'),
 }
+_NSF_SWEEP = [('num_bins', [3, 5, 7]),
+              ('num_blocks', [1, 2]),
+              ('num_layers', [2, 4, 6])]
 SWEEP = {
-    'lik': [('num_layers', [3, 4, 5, 6]),
-            ('latent_size_factor', [2, 3, 4]),
-            ('marg_lambda', [50, 100, 200, 300])],
-    'mmd': [('num_layers', [3, 4, 5, 6]),
-            ('latent_size_factor', [2, 3, 4]),
-            ('mmd_indicator_alpha', [1, 3, 5, 10]),
-            ('mmd_indicator_rho', [1, 3, 5])],
-    'bl': [('num_layers', [3, 4, 5, 6]),
-           ('hidden_mult', [2, 3, 4])],
+    'lik': _NSF_SWEEP + [('latent_size_factor', [2, 3, 4]),
+                         ('marg_lambda', [100, 200, 300, 500])],
+    'mmd': _NSF_SWEEP + [('latent_size_factor', [2, 3, 4]),
+                         ('mmd_indicator_alpha', [3, 5, 10]),
+                         ('mmd_indicator_rho', [3, 5])],
+    'bl': _NSF_SWEEP + [('hidden_mult', [2, 3, 4])],
     'par': [('generator', ['gaussian', 'gumbel', 'rev_gumbel', 'rev_exp', 'log_gamma'])],
 }
+
+
+def _fitter_cfg(model, cfg):
+    """Flat sweep cfg -> fitter kwargs (NSF keys nested in flow_kw)."""
+    if model == 'par':
+        return dict(cfg)
+    out = {k: v for k, v in cfg.items() if k not in NSF_KEYS}
+    out['flow_type'] = FLOW_TYPE
+    out['flow_kw'] = {k: cfg[k] for k in NSF_KEYS if k in cfg}
+    return out
 
 
 def _cfg_key(cfg):
@@ -107,6 +131,7 @@ def _merge_best(path, q, model, entry):
 def score_config(model, cfg, samples, folds, device, thres, q_clus, chi_emp, iu,
                  epochs):
     """5-fold CV of one config -> (rmse_chi of the fold-mean chi, fold epochs)."""
+    cfg = _fitter_cfg(model, cfg)
     if model == 'lik':
         cv = run_cv_gpdflow_likelihood(
             samples, folds, device, thres, epochs=epochs, samples_multiplier=SIM_MULT,
@@ -140,13 +165,13 @@ def score_config(model, cfg, samples, folds, device, thres, q_clus, chi_emp, iu,
     return (rmse if np.isfinite(rmse) else float('inf')), fold_epochs
 
 
-def tune(q, model, samples_origin, chi_emp, iu, device, res_dir, epochs):
+def tune(q, model, samples_origin, chi_emp, iu, device, res_dir, epochs, q_eval=Q_EVAL):
     n_obs = samples_origin.shape[0]
     thres = np.quantile(samples_origin, q, axis=0)
     cond = np.any(samples_origin > thres, axis=1)
     samples = samples_origin[cond, :] - thres.reshape(1, -1)
     p_cluster = samples.shape[0] / n_obs
-    q_clus = 1.0 - (1.0 - Q_EVAL) / p_cluster
+    q_clus = 1.0 - (1.0 - q_eval) / p_cluster
     folds = make_folds(len(samples), n_splits=5, seed=1234)
     print(f'\n##### q = {q} | {model}: slice {samples.shape}, '
           f'p_cluster = {p_cluster:.4f}, q_clus = {q_clus:.4f}', flush=True)
@@ -187,7 +212,7 @@ def tune(q, model, samples_origin, chi_emp, iu, device, res_dir, epochs):
     print(f'===== q = {q} | {model}: best {cur}  RMSE_chi(CV) = {win["rmse_chi"]:.5f}',
           flush=True)
     _merge_best(res_dir + 'best_configs.json', q, model,
-                dict(cfg=cur, median_epoch=win['median_epoch'],
+                dict(cfg=_fitter_cfg(model, cur), median_epoch=win['median_epoch'],
                      cv_rmse_chi=win['rmse_chi'], fold_epochs=win['fold_epochs']))
 
 
@@ -200,8 +225,7 @@ def main():
     args = ap.parse_args()
 
     epochs = 5 if args.smoke else 500
-    res_dir = DIR_OUT + ('threshold_sensitivity_smoke/' if args.smoke
-                         else 'threshold_sensitivity/')
+    res_dir = DIR_OUT + RES_NAME + ('_smoke/' if args.smoke else '/')
     os.makedirs(res_dir + 'tuning/', exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('device:', device)

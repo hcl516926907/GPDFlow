@@ -59,17 +59,22 @@ class ParametricMGPD(nn.Module):
         penalty_lambda (float): weight of the marginal-support barrier.
         fix_margin (bool): if True, sigma and gamma are held fixed (see
             DataTransform).
+        log_gamma_delta (float): 'log_gamma' only -- the shape is parameterised as
+            k_j = max(gamma_j, 0) + delta + softplus(raw_j), so k_j > gamma_j always.
+            With k_j < gamma_j the likelihood is unbounded at the lower GPD support
+            boundary (row log-lik ~ (k_j/gamma_j - 1) log(sigma_j + gamma_j x_j)).
     """
 
     def __init__(self, dim, generator, device, s_half_width=35.0,
                  num_integration_points=1500, penalty_lambda=1e4,
-                 fix_margin=False):
+                 fix_margin=False, log_gamma_delta=0.1):
         super().__init__()
         assert generator in GENERATORS, generator
         self.dim = int(dim)
         self.device = device
         self.generator = generator
         self.penalty_lambda = float(penalty_lambda)
+        self.log_gamma_delta = float(log_gamma_delta)
         self.s_half_width = float(s_half_width)
         self.num_integration_points = int(num_integration_points)
 
@@ -104,11 +109,17 @@ class ParametricMGPD(nn.Module):
     def _loc(self):
         return F.pad(self.gen_loc_free, (1, 0))              # (dim,)  loc[0] = 0
 
+    def _log_gamma_k(self):
+        # k_j >= max(gamma_j, 0) + delta keeps the likelihood bounded at the lower
+        # GPD support boundary (see log_gamma_delta in the class docstring)
+        floor = F.relu(self.get_gamma()) + self.log_gamma_delta
+        return (floor + F.softplus(self.gen_log_shape)).clamp(max=1e3)
+
     def _gen_mode(self):
         # per-component mode of T_j, used only to anchor the integration grid
         mu = self._loc()
         if self.generator == 'log_gamma':                   # d/dt: k - e^{t-mu} = 0
-            k = F.softplus(self.gen_log_shape).clamp(0.1, 1e3)
+            k = self._log_gamma_k()
             return mu + torch.log(k)
         return mu                                           # gumbel / rev_gumbel / rev_exp / gaussian
 
@@ -137,7 +148,7 @@ class ParametricMGPD(nn.Module):
                                    torch.full_like(w, -1e30))
             return logf.sum(dim=-1)
         if g == 'log_gamma':                                    # T = log Gamma(k, 1) + mu
-            k = F.softplus(self.gen_log_shape).clamp(0.1, 1e3)
+            k = self._log_gamma_k()
             u = t - mu
             logf = -torch.lgamma(k) + k * u - torch.exp(torch.clamp(u, max=30.0))
             return logf.sum(dim=-1)
@@ -330,7 +341,7 @@ class ParametricMGPD(nn.Module):
             else:
                 samples_T = mu - b * (-torch.log(U))
         elif g == 'log_gamma':
-            k = F.softplus(self.gen_log_shape).clamp(0.1, 1e3).cpu().numpy()
+            k = self._log_gamma_k().cpu().numpy()
             G = np.random.gamma(shape=k[None, :], scale=1.0, size=(n_samples, d))
             samples_T = mu + torch.log(
                 torch.tensor(G, dtype=mu.dtype, device=dev).clamp_min(1e-30))
@@ -351,7 +362,8 @@ class ParametricMGPD(nn.Module):
 
 def fit_parametric_mgpd(generator, train_arr, val_arr, device,
                         epochs=300, batch_size=256, seed=1234, patience=40,
-                        verbose=True, fix_margin=False, stop_at_epoch=None):
+                        verbose=True, fix_margin=False, stop_at_epoch=None,
+                        log_gamma_delta=0.1):
     """Fit one parametric-generator mGPD by stochastic-gradient MLE.
 
     Args:
@@ -368,6 +380,8 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
             regardless of the patience rule (``epochs`` -- hence the cosine
             ``T_max`` -- is left unchanged).  Used for the final full-data refit
             at the median of the per-fold CV early-stop epochs.
+        log_gamma_delta (float): margin of the k_j > gamma_j constraint of the
+            'log_gamma' generator (see ParametricMGPD).
 
     ``val_arr=None`` switches validation off: no early stopping / checkpoint
     selection, training runs to ``stop_at_epoch`` (or ``epochs``) and the
@@ -384,7 +398,8 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
         torch.cuda.manual_seed_all(seed)
 
     dim = train_arr.shape[1]
-    model = ParametricMGPD(dim, generator, device, fix_margin=fix_margin).to(device)
+    model = ParametricMGPD(dim, generator, device, fix_margin=fix_margin,
+                           log_gamma_delta=log_gamma_delta).to(device)
 
     # marginal init from a per-margin GPD fit on the positive excesses (cf. cell 21);
     # skipped when fix_margin=True (data already standardized, sigma/gamma pinned).
@@ -401,6 +416,12 @@ def fit_parametric_mgpd(generator, train_arr, val_arr, device,
                 torch.log(torch.tensor(init_sigma, dtype=torch.float32, device=device)))
             model.data_transform.theta.copy_(
                 torch.atanh(torch.tensor(init_gamma, dtype=torch.float32, device=device)))
+            if generator == 'log_gamma':
+                # start at k_j ~ 1 as before, net of the max(gamma_j, 0) + delta floor
+                raw = [_inv_softplus(max(1.0 - max(g, 0.0) - log_gamma_delta, 1e-3))
+                       for g in init_gamma]
+                model.gen_log_shape.copy_(
+                    torch.tensor(raw, dtype=torch.float32, device=device))
 
     train_data = torch.tensor(np.asarray(train_arr), dtype=torch.float32, device=device)
     no_val = val_arr is None

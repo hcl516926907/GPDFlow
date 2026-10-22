@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader
 from GPDFlow_S import (
     S_mGPD_NF,
     ConditionalMaskedAffineFlow,
+    ConditionalSplineCoupling,
     ActNormConditional,
     ConditionalNormalizingFlow,
 )
@@ -81,21 +82,43 @@ def make_folds(n, n_splits=5, seed=1234):
 # ---------------------------------------------------------------------------
 
 def build_conditional_flow(dim, device, *, num_layers=4, latent_size_factor=2,
-                           embed_dim_mult=3, seed=0):
+                           embed_dim_mult=3, seed=0, flow_type='realnvp',
+                           num_bins=8, num_blocks=2, tail_bound=5.0):
     """Rebuild the exact S-representation flow of notebook cells 19 / 32.
 
     ``torch.manual_seed(seed)`` is called immediately before construction (as in
     both training cells) so the ``nn.Embedding`` / MLP init is identical every
     fold.
+
+    ``flow_type='realnvp'`` (default) builds the conditional affine coupling
+    flow; ``flow_type='nsf'`` swaps each coupling layer for a conditional
+    rational-quadratic spline coupling (``num_bins`` bins on
+    ``[-tail_bound, tail_bound]``, a ``num_blocks``-block ResidualNet of width
+    ``latent_size_factor * latent_size``).  ActNorm layers are kept in both.
     """
+    if flow_type not in ('realnvp', 'nsf'):
+        raise ValueError(f"flow_type must be 'realnvp' or 'nsf', got {flow_type!r}")
     latent_size = dim - 1
     embed_dim = embed_dim_mult * latent_size
-    base_s = nf.distributions.DiagGaussian(latent_size)
+    # ConditionalNormalizingFlow.sample draws from N(0, I) and ignores the
+    # base's loc/log_scale, while log_prob uses them; a trainable base lets the
+    # two drift apart.  Fixed for 'nsf'; 'realnvp' keeps the trainable base so
+    # existing results reproduce.
+    base_s = nf.distributions.DiagGaussian(latent_size,
+                                           trainable=(flow_type == 'realnvp'))
 
     torch.manual_seed(seed)
     b = torch.Tensor([1 if i % 2 == 0 else 0 for i in range(latent_size)])
     flows = []
     for i in range(num_layers):
+        if flow_type == 'nsf':
+            flows.append(ConditionalSplineCoupling(
+                latent_size, embed_dim, latent_size_factor * latent_size,
+                num_blocks=num_blocks, num_bins=num_bins,
+                tail_bound=tail_bound, reverse_mask=(i % 2 == 1),
+            ))
+            flows.append(ActNormConditional(latent_size))
+            continue
         mask = b if i % 2 == 0 else (1 - b)
         s_net = nf.nets.MLP(
             [latent_size + embed_dim, latent_size_factor * latent_size, latent_size],
@@ -113,14 +136,31 @@ def build_conditional_flow(dim, device, *, num_layers=4, latent_size_factor=2,
     ).to(device)
 
 
-def build_baseline_flow(dim, device, *, num_layers=4, hidden_mult=2):
+def build_baseline_flow(dim, device, *, num_layers=4, hidden_mult=2,
+                        flow_type='realnvp', num_bins=8, num_blocks=2,
+                        tail_bound=4.0):
     """Rebuild the unconditional probit-copula RealNVP of notebook cell 42.
 
     The caller is responsible for seeding torch/numpy/random beforehand (cell 42
     seeds once and does not reseed per layer).
+
+    ``flow_type='nsf'`` uses rational-quadratic spline coupling layers instead
+    (same depth, hidden width ``hidden_mult * dim``); probit-scale data is
+    roughly N(0, 1), so ``tail_bound=4`` covers it.
     """
+    if flow_type not in ('realnvp', 'nsf'):
+        raise ValueError(f"flow_type must be 'realnvp' or 'nsf', got {flow_type!r}")
     nf_base = nf.distributions.DiagGaussian(dim)
     hidden = hidden_mult * dim
+    if flow_type == 'nsf':
+        nf_flows = []
+        for i in range(num_layers):
+            nf_flows.append(nf.flows.CoupledRationalQuadraticSpline(
+                dim, num_blocks, hidden, num_bins=num_bins,
+                tail_bound=tail_bound, reverse_mask=(i % 2 == 1),
+            ))
+            nf_flows.append(nf.flows.ActNorm(dim))
+        return nf.NormalizingFlow(nf_base, nf_flows).to(device)
     nf_b = torch.tensor([1 if i % 2 == 0 else 0 for i in range(dim)], dtype=torch.float32)
     nf_flows = []
     for i in range(num_layers):
@@ -235,6 +275,7 @@ def fit_gpdflow_likelihood(train_arr, val_arr, device, *, epochs=500,
                            batch_size=256, patience=100, min_delta=0.0,
                            penalty_lambda=1e6, marg_lambda=500.0,
                            num_layers=4, latent_size_factor=2,
+                           flow_type='realnvp', flow_kw=None,
                            seed=1234, flow_seed=0, grad_clip=1.0,
                            init_from_gpd=False, stop_at_epoch=None,
                            verbose=True, detect_anomaly=False):
@@ -251,6 +292,9 @@ def fit_gpdflow_likelihood(train_arr, val_arr, device, *, epochs=500,
         ``(model, best_val, hist)`` where ``best_val`` is the best epoch-mean
         validation NLL and ``hist`` holds the per-epoch trajectories.
 
+    ``flow_type`` ('realnvp' | 'nsf') and ``flow_kw`` (e.g. ``num_bins``,
+    ``num_blocks``, ``tail_bound``) are forwarded to the flow builder.
+
     ``val_arr=None`` switches validation off: no early stopping / checkpoint
     selection, training runs to ``stop_at_epoch`` (or ``epochs``) and the
     final weights are kept; ``best_val`` is then ``nan`` and
@@ -262,6 +306,7 @@ def fit_gpdflow_likelihood(train_arr, val_arr, device, *, epochs=500,
     flow_model = build_conditional_flow(
         dim, device, num_layers=num_layers,
         latent_size_factor=latent_size_factor, seed=flow_seed,
+        flow_type=flow_type, **(flow_kw or {}),
     )
     model = S_mGPD_NF(
         dim=dim, flow=flow_model, device=device,
@@ -396,10 +441,11 @@ def fit_gpdflow_likelihood(train_arr, val_arr, device, *, epochs=500,
 
 def fit_gpdflow_mmd(train_arr, val_arr, device, *, epochs=500, batch_size=400,
                     patience=100, warmup_epochs=50, min_delta=1e-3,
-                    penalty_lambda=1e4, mmd_lambda=25.0, mmd_samples_per_face=128,
+                    penalty_lambda=1e4, mmd_lambda=1.0, mmd_samples_per_face=128,
                     mmd_censor_c=0.0, mmd_censor_tau=0.15,
                     mmd_indicator_alpha=10.0, mmd_indicator_rho=5.0,
                     num_layers=4, latent_size_factor=2,
+                    flow_type='realnvp', flow_kw=None, actnorm_data_init=False,
                     seed=1234, flow_seed=0, grad_clip=1.0, stop_at_epoch=None,
                     verbose=True, detect_anomaly=False):
     """Fit the MMD-based GPDFlow (``fix_margin=True``, ``use_likelihood=False``)
@@ -413,6 +459,11 @@ def fit_gpdflow_mmd(train_arr, val_arr, device, *, epochs=500, batch_size=400,
     Returns:
         ``(model, best_val, hist)``.
 
+    ``flow_type`` ('realnvp' | 'nsf') and ``flow_kw`` (e.g. ``num_bins``,
+    ``num_blocks``, ``tail_bound``) are forwarded to the flow builder.
+    ``actnorm_data_init=True`` initialises the ActNorm layers on the training
+    rows before the first step (off by default).
+
     ``val_arr=None`` switches validation off: no early stopping / checkpoint
     selection, training runs to ``stop_at_epoch`` (or ``epochs``) and the
     final weights are kept; ``best_val`` is then ``nan`` and
@@ -424,6 +475,7 @@ def fit_gpdflow_mmd(train_arr, val_arr, device, *, epochs=500, batch_size=400,
     flow_model = build_conditional_flow(
         dim, device, num_layers=num_layers,
         latent_size_factor=latent_size_factor, seed=flow_seed,
+        flow_type=flow_type, **(flow_kw or {}),
     )
     model = S_mGPD_NF(
         dim=dim, flow=flow_model, device=device,
@@ -447,6 +499,14 @@ def fit_gpdflow_mmd(train_arr, val_arr, device, *, epochs=500, batch_size=400,
     if not no_val:
         val_data = torch.tensor(np.asarray(val_arr), dtype=torch.float32, device=device)
         val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    # The MMD loss never calls log_prob, so ActNorm's data-dependent init would
+    # otherwise run on the first sample() (base -> data) and set r_fake to
+    # mean 0 / sd 1.  One log_prob pass on the training rows initialises it on
+    # the real r instead.
+    if actnorm_data_init:
+        with torch.no_grad():
+            model.log_prob(train_data)
 
     best_val = float('inf')
     best_state = None
@@ -543,6 +603,7 @@ def fit_flow_baseline(W_train, W_val, device, *, epochs=400, batch_size=256,
                       lr=1e-3, weight_decay=1e-4, sigma_jitter=0.10,
                       num_layers=4, hidden_mult=2, warmup=20, patience=40,
                       min_delta=0.0, seed=0, grad_clip=1.0, stop_at_epoch=None,
+                      flow_type='realnvp', flow_kw=None,
                       verbose=True):
     """Fit the unconditional RealNVP on pseudo-Gaussian data by maximum
     likelihood, selecting / early-stopping on the held-out **NLL** after a
@@ -556,6 +617,9 @@ def fit_flow_baseline(W_train, W_val, device, *, epochs=400, batch_size=256,
     Returns:
         ``(flow, best_val, hist)`` where ``best_val`` is the best held-out NLL.
 
+    ``flow_type`` ('realnvp' | 'nsf') and ``flow_kw`` (e.g. ``num_bins``,
+    ``num_blocks``, ``tail_bound``) are forwarded to the flow builder.
+
     ``W_val=None`` switches validation off: no early stopping / checkpoint
     selection, training runs to ``stop_at_epoch`` (or ``epochs``) and the
     final weights are kept; ``best_val`` is then ``nan`` and
@@ -563,7 +627,9 @@ def fit_flow_baseline(W_train, W_val, device, *, epochs=400, batch_size=256,
     """
     _reset_seeds(seed)
     dim = W_train.shape[1]
-    flow = build_baseline_flow(dim, device, num_layers=num_layers, hidden_mult=hidden_mult)
+    flow = build_baseline_flow(dim, device, num_layers=num_layers,
+                               hidden_mult=hidden_mult, flow_type=flow_type,
+                               **(flow_kw or {}))
 
     no_val = W_val is None
     Wt = torch.tensor(np.asarray(W_train), dtype=torch.float32, device=device)

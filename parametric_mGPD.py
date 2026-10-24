@@ -1,14 +1,14 @@
 """
 Parametric mGPD -- T-representation with a fixed parametric generator.
 
-Same mGPD skeleton as GPDFlow (GPDFlow.py::T_mGPD_NF), but the generator T is one
+Same mGPD skeleton as GPDFlow (T-representation, CLAUDE.md 3.2), but the generator T is one
 of five parametric families instead of a normalizing flow.  Standardized-mGPD
 log-density
 
     log h(z) = log \\int f_T(z + s 1) ds  -  max(z)                (CLAUDE.md 3.4)
 
 with the 1-D shift integral evaluated by the trapezoidal rule + log-sum-exp
-stabiliser, mirroring GPDFlow.py::T_mGPD_NF.log_integral_f_T.  On the
+stabiliser, as in the GPDFlow likelihood (CLAUDE.md 4).  On the
 observational scale the marginal Jacobian -sum_j log(sigma_j + gamma_j x_j) is
 added, with z = g_std(x; sigma, gamma).
 
